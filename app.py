@@ -15,10 +15,10 @@ import yaml
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 MAX_PAGES_DEFAULT = 20
 MAX_CHARS_FOR_LLM = 12000
-USER_AGENT = "CT-OKF-Builder/0.2 (+internal knowledge-bundle generation)"
+USER_AGENT = "CT-OKF-Builder/0.3 (+internal knowledge-bundle generation)"
 
 st.set_page_config(page_title="CT OKF Builder", page_icon="🧠", layout="wide")
 st.title("CT OKF Builder")
@@ -41,10 +41,10 @@ with st.sidebar:
     max_pages = st.slider("Maximum website pages", 1, 100, MAX_PAGES_DEFAULT)
     delay = st.slider("Delay between page requests (seconds)", 0.0, 2.0, 0.25, 0.05)
     api_key = st.text_input(
-        "OpenAI API key (optional)", type="password",
-        help="Used only when you click Generate concepts. You can also configure OPENAI_API_KEY in Streamlit secrets."
+        "Claude API key (optional)", type="password",
+        help="Used only when you click Generate concepts. You can also configure ANTHROPIC_API_KEY in Streamlit secrets."
     )
-    model = st.text_input("OpenAI model", value="gpt-4o-mini")
+    model = st.text_input("Claude model", value="claude-3-haiku-20240307")
     st.caption("Without an API key, the app creates standard OKF draft bundles using clean source Markdown.")
 
 if "sources" not in st.session_state:
@@ -231,15 +231,17 @@ def fallback_concepts(sources):
 
 def llm_extract(sources, key, model_name, depth, business):
     try:
-        from openai import OpenAI
+        import anthropic
     except ImportError:
-        raise RuntimeError("The OpenAI package is missing. Install dependencies from requirements.txt.")
-    client = OpenAI(api_key=key)
+        raise RuntimeError("The anthropic package is missing. Install it via pip install anthropic.")
+        
+    client = anthropic.Anthropic(api_key=key)
     
     source_payload = [
         {"title": s.get("title", ""), "url": s.get("url", ""), "content": s.get("text", "")[:8500]}
         for s in sources[:30]
     ]
+    
     depth_note = {
         "Quick: core facts": "Return key concepts and basic relationships; merge near-duplicate titles.",
         "Standard: concepts + relationships": "Return distinct concepts and clear relationships across pages.",
@@ -247,18 +249,18 @@ def llm_extract(sources, key, model_name, depth, business):
     }[depth]
     
     prompt = f"""
-You are preparing a draft Open Knowledge Format (OKF v0.2) metadata extraction for a web asset.
+You are an expert Open Knowledge Format (OKF v0.2) metadata extraction agent.
 Client type: {business}
 Extraction mode: {depth_note}
 
-Return ONLY valid JSON matching this shape:
+Return ONLY valid JSON matching this exact shape. Do not include markdown code blocks, just raw JSON:
 {{
  "concepts": [
   {{
-   "type": "Descriptive concept type (e.g. Article, Service, Product, Guide, Organization)",
+   "type": "Specific Page Type",
    "title": "Exact title matching the source document",
    "description": "Comprehensive one-to-two sentence summary of the page content",
-   "tags": ["tag1", "tag2"],
+   "tags": ["theme1", "topic2", "category3"],
    "resource": "exact URL from source material",
    "facts": [{{"statement":"Key factual claim from text","source_url":"exact source URL"}}],
    "relationships": [{{"label":"related to","target_title":"exact title of another source document"}}],
@@ -267,25 +269,40 @@ Return ONLY valid JSON matching this shape:
  ]
 }}
 
-Rules:
-- Generate 1 concept per distinct webpage or uploaded item provided in source material.
-- Retain exact URLs in the resource field.
-- Do not make up information or facts.
-- Return JSON only, with no markdown code blocks.
+STRICT RULES:
+1. PAGE TYPE DETECTION: The "type" field MUST accurately reflect the specific nature of the webpage. 
+   - Use "Homepage" for the root domain index.
+   - Use "Service" for pages offering a specific business service.
+   - Use "Article" or "Blog Post" for informational content, news, or blog entries.
+   - Use "Product" for e-commerce items.
+   - Use "About" or "Organization" for company background pages.
+   - Use "Contact" for location/contact pages.
+2. TAGS: You MUST provide at least 3-5 relevant, lowercase tags in the "tags" array that describe the core topics or entities on the page. Do not leave the tags array empty.
+3. RESOURCE: Retain exact URLs in the resource field.
+4. FACTS: Do not make up information. Extract directly from the provided text.
 
 Source material:
 {json.dumps(source_payload, ensure_ascii=False)}
 """
-    response = client.chat.completions.create(
+    
+    response = client.messages.create(
         model=model_name,
+        max_tokens=4096,
+        temperature=0.1,
+        system="You are a precise data extraction agent. Return structured JSON only. Never omit the type or tags fields.",
         messages=[
-            {"role": "system", "content": "Return precise structured JSON."},
             {"role": "user", "content": prompt}
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1
+        ]
     )
-    data = json.loads(response.choices[0].message.content)
+    
+    # Safely parse Claude's response (handling potential markdown code block wrappers)
+    raw_response = response.content[0].text.strip()
+    if raw_response.startswith("```json"):
+        raw_response = raw_response[7:]
+    if raw_response.endswith("```"):
+        raw_response = raw_response[:-3]
+        
+    data = json.loads(raw_response.strip())
     extracted_concepts = data.get("concepts", [])
     
     # Map extracted concepts back to the complete markdown body
@@ -302,7 +319,7 @@ Source material:
         else:
             c["full_body"] = ""
             
-        c.setdefault("type", "Article")
+        c.setdefault("type", "Webpage")
         c.setdefault("title", "Untitled concept")
         c.setdefault("description", "")
         c.setdefault("tags", [])
@@ -538,7 +555,7 @@ with tab_input:
             key = api_key.strip()
             if not key:
                 try:
-                    key = st.secrets.get("OPENAI_API_KEY", "")
+                    key = st.secrets.get("ANTHROPIC_API_KEY", "")
                 except Exception:
                     key = ""
             with st.spinner("Extracting metadata & building concept structure..."):
