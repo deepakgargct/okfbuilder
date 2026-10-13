@@ -1,680 +1,419 @@
-import csv
-import io
-import json
-import re
-import time
-import zipfile
-from datetime import datetime, timezone
-from pathlib import Path
-from urllib.parse import urljoin, urlparse, urldefrag
-import xml.etree.ElementTree as ET
+"""OKF Builder — read pages, classify them, extract entities, bundle and lint.
 
-import requests
-import streamlit as st
-import yaml
-from bs4 import BeautifulSoup
-from markdownify import markdownify as md
-
-APP_VERSION = "0.3.0"
-MAX_PAGES_DEFAULT = 20
-MAX_CHARS_FOR_LLM = 12000
-USER_AGENT = "CT-OKF-Builder/0.3 (+internal knowledge-bundle generation)"
-
-st.set_page_config(page_title="CT OKF Builder", page_icon="🧠", layout="wide")
-st.title("CT OKF Builder")
-st.caption(f"Prototype v{APP_VERSION} · Generate, review, validate and export Open Knowledge Format (v0.2) bundles")
-st.warning(
-    "Review all generated concepts before client use. Do not upload confidential, personal, regulated, "
-    "or client-restricted data unless your organization's approved AI/data policy permits it."
-)
-
-with st.sidebar:
-    st.header("Generation settings")
-    business_type = st.selectbox(
-        "Client type",
-        ["Lead generation / services", "Ecommerce", "Mixed / other"]
-    )
-    extraction_depth = st.selectbox(
-        "Extraction depth",
-        ["Quick: core facts", "Standard: concepts + relationships", "Detailed: concepts + evidence"]
-    )
-    max_pages = st.slider("Maximum website pages", 1, 100, MAX_PAGES_DEFAULT)
-    delay = st.slider("Delay between page requests (seconds)", 0.0, 2.0, 0.25, 0.05)
-    api_key = st.text_input(
-        "Claude API key (optional)", type="password",
-        help="Used only when you click Generate concepts. You can also configure ANTHROPIC_API_KEY in Streamlit secrets."
-    )
-    model = st.text_input("Claude model", value="claude-3-haiku-20240307")
-    st.caption("Without an API key, the app creates standard OKF draft bundles using clean source Markdown.")
-
-if "sources" not in st.session_state:
-    st.session_state.sources = []
-if "concepts_json" not in st.session_state:
-    st.session_state.concepts_json = "[]"
-if "client_name" not in st.session_state:
-    st.session_state.client_name = "client"
-if "bundle" not in st.session_state:
-    st.session_state.bundle = {}
-
-def dedupe_sources(items):
-    seen = set()
-    result = []
-    for item in items:
-        key = item.get("url", "") + "|" + item.get("title", "")
-        if key not in seen:
-            result.append(item)
-            seen.add(key)
-    return result
-
-def clean_html_to_markdown(html):
-    soup = BeautifulSoup(html, "html.parser")
-    # Decompose non-content UI and script noise
-    for tag in soup(["script", "style", "noscript", "svg", "nav", "footer", "header", "aside", "form"]):
-        tag.decompose()
-        
-    title = soup.title.get_text(" ", strip=True) if soup.title else ""
-    main = soup.find("main") or soup.find("article") or soup.body or soup
-    
-    # Extract plain text for LLM metadata parsing
-    raw_text = re.sub(r"\n{3,}", "\n\n", main.get_text("\n", strip=True))
-    raw_text = re.sub(r"[ \t]+\n", "\n", raw_text)
-    
-    # Convert HTML to rich Markdown for full content preservation
-    markdown_body = md(str(main), heading_style="ATX", strip=['img'])
-    markdown_body = re.sub(r"\n{3,}", "\n\n", markdown_body).strip()
-    
-    return title, raw_text.strip(), markdown_body
-
-def fetch_url(url, timeout=15):
-    headers = {"User-Agent": USER_AGENT}
-    r = requests.get(url, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    ctype = r.headers.get("content-type", "").lower()
-    if "text/html" not in ctype and not url.lower().endswith((".html", ".htm")):
-        return None
-    title, text, markdown_body = clean_html_to_markdown(r.text)
-    return {
-        "title": title or url,
-        "url": url,
-        "text": text[:MAX_CHARS_FOR_LLM],
-        "markdown_body": markdown_body
-    }
-
-def same_domain(a, b):
-    try:
-        return urlparse(a).netloc.lower().removeprefix("www.") == urlparse(b).netloc.lower().removeprefix("www.")
-    except Exception:
-        return False
-
-def sitemap_urls(sitemap_url, limit):
-    found = []
-    seen_maps = set()
-    queue = [sitemap_url]
-    while queue and len(found) < limit:
-        sm = queue.pop(0)
-        if sm in seen_maps:
-            continue
-        seen_maps.add(sm)
-        try:
-            resp = requests.get(sm, headers={"User-Agent": USER_AGENT}, timeout=15)
-            resp.raise_for_status()
-            root = ET.fromstring(resp.content)
-            for node in root.iter():
-                if node.tag.endswith("}loc") or node.tag == "loc":
-                    loc = (node.text or "").strip()
-                    if not loc:
-                        continue
-                    if loc.lower().endswith(".xml") and len(found) == 0:
-                        queue.append(loc)
-                    elif loc not in found:
-                        found.append(loc)
-                        if len(found) >= limit:
-                            break
-        except Exception:
-            continue
-    return found[:limit]
-
-def crawl_site(start_url, limit, wait):
-    parsed = urlparse(start_url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ValueError("Enter a complete URL beginning with http:// or https://")
-    root = f"{parsed.scheme}://{parsed.netloc}"
-    candidate_maps = [urljoin(root, "/sitemap.xml"), urljoin(root, "/sitemap_index.xml")]
-    urls = []
-    for sm in candidate_maps:
-        urls = sitemap_urls(sm, limit)
-        if urls:
-            break
-    if not urls:
-        urls = [start_url]
-    urls = [start_url] + [u for u in urls if u.rstrip("/") != start_url.rstrip("/")]
-    urls = [u for u in urls if same_domain(root, u)][:limit]
-    results, errors = [], []
-    for i, url in enumerate(urls):
-        try:
-            item = fetch_url(url)
-            if item and item["text"]:
-                results.append(item)
-        except Exception as e:
-            errors.append(f"{url}: {str(e)[:180]}")
-        if wait and i < len(urls) - 1:
-            time.sleep(wait)
-    return results, errors
-
-def decode_upload(upload):
-    name = upload.name
-    raw = upload.getvalue()
-    suffix = Path(name).suffix.lower()
-    if suffix in (".html", ".htm"):
-        title, text, md_body = clean_html_to_markdown(raw.decode("utf-8", errors="replace"))
-        return [{
-            "title": title or name,
-            "url": f"upload://{name}",
-            "text": text[:MAX_CHARS_FOR_LLM],
-            "markdown_body": md_body
-        }]
-    if suffix in (".txt", ".md"):
-        txt = raw.decode("utf-8", errors="replace")
-        return [{
-            "title": name,
-            "url": f"upload://{name}",
-            "text": txt[:MAX_CHARS_FOR_LLM],
-            "markdown_body": txt
-        }]
-    if suffix == ".csv":
-        decoded = raw.decode("utf-8-sig", errors="replace")
-        rows = list(csv.DictReader(io.StringIO(decoded)))
-        chunks = []
-        for idx in range(0, len(rows), 20):
-            chunk_data = json.dumps(rows[idx:idx+20], ensure_ascii=False, indent=2)
-            chunks.append({
-                "title": f"{name} rows {idx+1}-{min(idx+20, len(rows))}",
-                "url": f"upload://{name}",
-                "text": chunk_data[:MAX_CHARS_FOR_LLM],
-                "markdown_body": f"```json\n{chunk_data}\n```"
-            })
-        return chunks
-    if suffix == ".pdf":
-        try:
-            from pypdf import PdfReader
-            reader = PdfReader(io.BytesIO(raw))
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
-            return [{
-                "title": name,
-                "url": f"upload://{name}",
-                "text": text[:MAX_CHARS_FOR_LLM],
-                "markdown_body": text
-            }]
-        except Exception as e:
-            raise ValueError(f"Could not read PDF {name}: {e}")
-    raise ValueError(f"Unsupported file type: {name}")
-
-def fallback_concepts(sources):
-    concepts = []
-    for i, src in enumerate(sources, start=1):
-        text = src.get("text", "").strip()
-        if not text:
-            continue
-        title = src.get("title") or f"Source {i}"
-        concepts.append({
-            "type": "Article",
-            "title": title,
-            "description": f"Extracted knowledge page for {title}.",
-            "tags": ["extracted-page"],
-            "resource": src.get("url", ""),
-            "full_body": src.get("markdown_body", text),
-            "facts": [],
-            "relationships": [],
-            "verification_status": "unverified"
-        })
-    return concepts
-
-def llm_extract(sources, key, model_name, depth, business):
-    try:
-        import anthropic
-    except ImportError:
-        raise RuntimeError("The anthropic package is missing. Install it via pip install anthropic.")
-        
-    client = anthropic.Anthropic(api_key=key)
-    
-    source_payload = [
-        {"title": s.get("title", ""), "url": s.get("url", ""), "content": s.get("text", "")[:8500]}
-        for s in sources[:30]
-    ]
-    
-    depth_note = {
-        "Quick: core facts": "Return key concepts and basic relationships; merge near-duplicate titles.",
-        "Standard: concepts + relationships": "Return distinct concepts and clear relationships across pages.",
-        "Detailed: concepts + evidence": "Return detailed concepts with facts, explicit relationships, and detailed frontmatter tags."
-    }[depth]
-    
-    prompt = f"""
-You are an expert Open Knowledge Format (OKF v0.2) metadata extraction agent.
-Client type: {business}
-Extraction mode: {depth_note}
-
-Return ONLY valid JSON matching this exact shape. Do not include markdown code blocks, just raw JSON:
-{{
- "concepts": [
-  {{
-   "type": "Specific Page Type",
-   "title": "Exact title matching the source document",
-   "description": "Comprehensive one-to-two sentence summary of the page content",
-   "tags": ["theme1", "topic2", "category3"],
-   "resource": "exact URL from source material",
-   "facts": [{{"statement":"Key factual claim from text","source_url":"exact source URL"}}],
-   "relationships": [{{"label":"related to","target_title":"exact title of another source document"}}],
-   "verification_status": "unverified"
-  }}
- ]
-}}
-
-STRICT RULES:
-1. PAGE TYPE DETECTION: The "type" field MUST accurately reflect the specific nature of the webpage. 
-   - Use "Homepage" for the root domain index.
-   - Use "Service" for pages offering a specific business service.
-   - Use "Article" or "Blog Post" for informational content, news, or blog entries.
-   - Use "Product" for e-commerce items.
-   - Use "About" or "Organization" for company background pages.
-   - Use "Contact" for location/contact pages.
-2. TAGS: You MUST provide at least 3-5 relevant, lowercase tags in the "tags" array that describe the core topics or entities on the page. Do not leave the tags array empty.
-3. RESOURCE: Retain exact URLs in the resource field.
-4. FACTS: Do not make up information. Extract directly from the provided text.
-
-Source material:
-{json.dumps(source_payload, ensure_ascii=False)}
+Run:  streamlit run app.py
 """
-    
-    response = client.messages.create(
-        model=model_name,
-        max_tokens=4096,
-        temperature=0.1,
-        system="You are a precise data extraction agent. Return structured JSON only. Never omit the type or tags fields.",
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
-    )
-    
-    # Safely parse Claude's response (handling potential markdown code block wrappers)
-    raw_response = response.content[0].text.strip()
-    if raw_response.startswith("```json"):
-        raw_response = raw_response[7:]
-    if raw_response.endswith("```"):
-        raw_response = raw_response[:-3]
-        
-    data = json.loads(raw_response.strip())
-    extracted_concepts = data.get("concepts", [])
-    
-    # Map extracted concepts back to the complete markdown body
-    url_to_source = {s.get("url"): s for s in sources}
-    title_to_source = {s.get("title"): s for s in sources}
-    
-    for c in extracted_concepts:
-        res = c.get("resource", "")
-        title = c.get("title", "")
-        matched_src = url_to_source.get(res) or title_to_source.get(title)
-        
-        if matched_src:
-            c["full_body"] = matched_src.get("markdown_body", matched_src.get("text", ""))
-        else:
-            c["full_body"] = ""
-            
-        c.setdefault("type", "Webpage")
-        c.setdefault("title", "Untitled concept")
-        c.setdefault("description", "")
-        c.setdefault("tags", [])
-        c.setdefault("resource", "")
-        c.setdefault("facts", [])
-        c.setdefault("relationships", [])
-        c["verification_status"] = "unverified"
-        
-    return extracted_concepts
+from __future__ import annotations
 
-def slugify(s):
-    s = re.sub(r"[^\w\s-]", "", str(s), flags=re.UNICODE).strip().lower()
-    s = re.sub(r"[\s_-]+", "-", s)
-    return s[:70] or "concept"
+import json
+import os
+from collections import Counter, defaultdict
 
-def yaml_frontmatter(concept, slug):
-    sources = []
-    seen = set()
-    for fact in concept.get("facts", []):
-        u = str(fact.get("source_url", "")).strip()
-        if u and u not in seen:
-            sources.append({"resource": u})
-            seen.add(u)
-            
-    resource = str(concept.get("resource", "")).strip()
-    if resource and resource not in seen:
-        sources.append({"resource": resource})
-        
-    fm = {
-        "type": str(concept.get("type") or "Article"),
-        "title": str(concept.get("title") or slug),
-        "description": str(concept.get("description") or ""),
-        "tags": [str(x) for x in concept.get("tags", []) if str(x).strip()],
-        "generated": {
-            "by": f"ct_okf_builder/{APP_VERSION}",
-            "at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        },
-        "verified": [],
-        "status": "stable"
-    }
-    if sources:
-        fm["sources"] = sources
-    if resource.startswith(("http://", "https://")):
-        fm["resource"] = resource
-    return "---\n" + yaml.safe_dump(fm, sort_keys=False, allow_unicode=True, default_flow_style=False).strip() + "\n---\n"
+import pandas as pd
+import streamlit as st
+import streamlit.components.v1 as components
 
-def render_concept(concept, slug, title_to_slug):
-    body = []
-    
-    # Optional metadata summary block
-    rels = concept.get("relationships", [])
-    facts = concept.get("facts", [])
-    
-    if rels or facts:
-        body.append("## AI-Extracted Context\n")
-        if facts:
-            body.append("### Key Facts")
-            for fact in facts:
-                statement = str(fact.get("statement", "")).strip()
-                source = str(fact.get("source_url", "")).strip()
-                if statement:
-                    line = f"- {statement}"
-                    if source:
-                        line += f" ([source]({source}))"
-                    body.append(line)
-            body.append("")
-            
-        if rels:
-            body.append("### Linked Concepts")
-            for rel in rels:
-                label = str(rel.get("label", "related to")).strip()
-                target = str(rel.get("target_title", "")).strip()
-                target_slug = title_to_slug.get(target)
-                if target_slug and target_slug != slug:
-                    body.append(f"- {label}: [{target}](concepts/{target_slug}.md)")
-                elif target:
-                    body.append(f"- {label}: {target}")
-            body.append("")
-        body.append("---\n")
+from okfkit.bundler import BuildOptions, build_bundle, norm_key, read_zip, zip_bundle
+from okfkit.classifier import PAGE_TYPES, okf_type_for
+from okfkit.extractor import ENTITY_TYPES, analyze_heuristic, analyze_llm, spacy_available
+from okfkit.fetcher import crawl, fetch_many, parse_upload, sitemap_urls
+from okfkit.fixer import apply_fixes
+from okfkit.graph import graph_json, render_html
+from okfkit.llm import DEFAULT_MODELS, LLMError
+from okfkit.validator import validate
 
-    # Append complete original document text
-    full_text = concept.get("full_body", "").strip()
-    if full_text:
-        body.append(full_text)
-    else:
-        body.append(f"# {concept.get('title') or slug}\n\n{concept.get('description', '')}")
+st.set_page_config(page_title="OKF Builder", page_icon="🧠", layout="wide")
 
-    return yaml_frontmatter(concept, slug) + "\n" + "\n".join(body).strip() + "\n"
+ss = st.session_state
+for k, v in {"pages": [], "analyses": [], "bundle": {}, "report": None, "report_files": {},
+             "report_src": ""}.items():
+    ss.setdefault(k, v)
 
-def make_bundle(concepts, client_slug):
-    files = {}
-    used = set()
-    title_to_slug = {}
-    
-    for c in concepts:
-        base = slugify(c.get("title") or "concept")
-        slug = base
-        counter = 2
-        while slug in used or slug in ("index", "log"):
-            slug = f"{base}-{counter}"
-            counter += 1
-        used.add(slug)
-        title_to_slug[str(c.get("title") or slug)] = slug
-        c["_slug"] = slug
-        
-    grouped = {}
-    for c in concepts:
-        slug = c["_slug"]
-        path = f"concepts/{slug}.md"
-        files[path] = render_concept(c, slug, title_to_slug)
-        grouped.setdefault(str(c.get("type") or "Article"), []).append((c, path))
-        
-    index = [
-        "# OKF Knowledge Bundle",
-        "",
-        f"- Client: {client_slug}",
-        "- Target Spec: OKF v0.2",
-        f"- Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
-        "",
-        "## Knowledge Graph Concepts",
-        ""
-    ]
-    
-    for typ, items in sorted(grouped.items()):
-        index += [f"### {typ}", ""]
-        for c, path in items:
-            desc = str(c.get("description", "")).strip()
-            index.append(f"* [{c.get('title', path)}]({path})" + (f" - {desc}" if desc else ""))
-        index.append("")
-        
-    files["index.md"] = "\n".join(index).rstrip() + "\n"
-    files["log.md"] = (
-        "# Update Log\n\n"
-        f"## {datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n\n"
-        f"* **Creation**: Initial OKF v0.2 bundle compiled with CT OKF Builder {APP_VERSION}.\n"
-    )
-    return files
+# --------------------------------------------------------------------------- #
+# Sidebar
+# --------------------------------------------------------------------------- #
+with st.sidebar:
+    st.header("🧠 OKF Builder")
+    st.caption("Targets **OKF v0.2** (GoogleCloudPlatform/open-knowledge-format, rev. Aug 21 2026).")
 
-def validate_bundle(files):
-    issues = []
-    concept_count = 0
-    for path, content in files.items():
-        if not path.endswith(".md") or path.split("/")[-1] in ("index.md", "log.md"):
-            continue
-        concept_count += 1
-        if not content.startswith("---\n"):
-            issues.append(("ERROR", path, "Missing YAML frontmatter opening delimiter."))
-            continue
-        parts = content.split("---", 2)
-        if len(parts) < 3:
-            issues.append(("ERROR", path, "Missing YAML frontmatter closing delimiter."))
-            continue
+    st.subheader("Extraction")
+    engine = st.radio("Engine", ["Heuristic (no API key)", "LLM (recommended)"], index=0,
+                      help="LLM mode extracts real concepts and playbooks, not just named things.")
+    provider = model = api_key = None
+    if engine.startswith("LLM"):
+        provider = st.selectbox("Provider", list(DEFAULT_MODELS))
+        model = st.text_input("Model ID", DEFAULT_MODELS[provider],
+                              help="Editable: providers rename and retire model IDs.")
+        env = {"Anthropic": "ANTHROPIC_API_KEY", "Google Gemini": "GEMINI_API_KEY", "OpenAI": "OPENAI_API_KEY"}[provider]
+        default_key = os.environ.get(env, "")
         try:
-            fm = yaml.safe_load(parts[1])
-            if not isinstance(fm, dict) or not str(fm.get("type", "")).strip():
-                issues.append(("ERROR", path, "Frontmatter must contain a non-empty 'type'."))
-            elif not isinstance(fm.get("type"), str):
-                issues.append(("ERROR", path, "'type' must be a string."))
-        except Exception as e:
-            issues.append(("ERROR", path, f"YAML parsing failed: {e}"))
-            
-    if concept_count == 0:
-        issues.append(("ERROR", "-", "No concept documents found."))
-    if "index.md" not in files:
-        issues.append(("WARNING", "-", "Bundle has no root index.md."))
-    if "log.md" not in files:
-        issues.append(("WARNING", "-", "Bundle has no root log.md."))
-    return issues, concept_count
+            default_key = default_key or st.secrets.get(env, "")
+        except Exception:  # noqa: BLE001 - no secrets file
+            pass
+        api_key = st.text_input("API key", default_key, type="password", help=f"Or set {env}")
+    elif not spacy_available():
+        st.caption("Tip: `pip install spacy && python -m spacy download en_core_web_sm` "
+                   "improves heuristic entity extraction.")
+    max_entities = st.slider("Max entities per page", 3, 40, 15)
+    max_concepts = st.slider("Max concepts per page (LLM)", 1, 20, 8)
+    min_mentions = st.slider("Heuristic: min mentions", 1, 6, 2)
 
-tab_input, tab_review, tab_export = st.tabs(["1 · Sources", "2 · Review concepts", "3 · Validate & export"])
+    st.subheader("Bundle")
+    b_title = st.text_input("Bundle title", "Website Knowledge Bundle")
+    b_desc = st.text_input("Bundle description", "Concepts, entities and pages extracted from the website.")
+    vocab = st.radio("Type vocabulary", ["page", "brain"],
+                     format_func=lambda v: {"page": "Page types (Article, Product, FAQ…)",
+                                            "brain": "Brain types (Concept, Entity, System, Playbook, Reference)"}[v])
+    status = st.selectbox("status", ["draft", "stable"], index=0,
+                          help="§5.4 — machine-written, unreviewed content is honestly `draft`.")
+    stale_days = st.number_input("stale_after (days from today)", 7, 3650, 180)
+    content_mode = st.selectbox("Page body", ["full", "excerpt", "none"],
+                                help="How much of each page's cleaned content to embed under # Content.")
+    min_pages = st.number_input("Heuristic entities: min pages", 1, 20, 1)
+    reviewer = st.text_input("Reviewer actor (for pages you tick 'reviewed')", "",
+                             placeholder="human:yourname",
+                             help="Only pages you actually checked get a `verified` entry. Must start with human:")
 
-with tab_input:
-    st.subheader("Add source material")
-    site_url = st.text_input("Website URL", placeholder="https://clientwebsite.com")
-    col1, col2 = st.columns(2)
-    with col1:
-        crawl_clicked = st.button("Crawl website", type="primary", use_container_width=True)
-    with col2:
-        clear_clicked = st.button("Clear collected sources", use_container_width=True)
-        
-    uploads = st.file_uploader(
-        "Or upload files", type=["html", "htm", "txt", "md", "csv", "pdf"],
-        accept_multiple_files=True, help="Extracts native formatting to Markdown."
-    )
-    
-    if clear_clicked:
-        st.session_state.sources = []
-        st.session_state.concepts_json = "[]"
-        st.session_state.bundle = {}
-        st.success("Cleared current session.")
-        
-    if crawl_clicked:
-        if not site_url.strip():
-            st.error("Enter a website URL first.")
+    st.subheader("Fetching")
+    delay = st.slider("Delay between requests (s)", 0.0, 3.0, 0.5, 0.25)
+    robots = st.checkbox("Respect robots.txt", True)
+
+
+def run_analysis(pages):
+    out, bar = [], st.progress(0.0, "Analysing…")
+    for i, p in enumerate(pages, 1):
+        if not p.ok:
+            a = analyze_heuristic(p) if p.markdown else None
+            if a is None:
+                from okfkit.classifier import Classification
+                from okfkit.extractor import PageAnalysis
+                a = PageAnalysis(p, Classification("Webpage", 0.0, [p.error]), "Webpage", include=False, error=p.error)
+            out.append(a)
+        elif engine.startswith("LLM"):
+            try:
+                out.append(analyze_llm(p, provider, model, api_key, max_entities, max_concepts))
+            except (LLMError, ValueError) as e:
+                a = analyze_heuristic(p, min_mentions, max_entities)
+                a.error = f"LLM failed, used heuristics: {e}"
+                out.append(a)
         else:
-            with st.spinner("Crawling website and extracting clean Markdown..."):
-                try:
-                    crawled, errors = crawl_site(site_url.strip(), max_pages, delay)
-                    st.session_state.sources.extend(crawled)
-                    st.session_state.sources = dedupe_sources(st.session_state.sources)
-                    if crawled:
-                        st.success(f"Collected {len(crawled)} page(s).")
-                    else:
-                        st.warning("No readable HTML pages were collected.")
-                    if errors:
-                        with st.expander(f"Fetch warnings ({len(errors)})"):
-                            st.write("\n".join(errors))
-                except Exception as e:
-                    st.error(str(e))
-                    
-    if uploads:
-        if st.button("Import uploaded files"):
-            added, errors = [], []
-            for up in uploads:
-                try:
-                    added.extend(decode_upload(up))
-                except Exception as e:
-                    errors.append(str(e))
-            st.session_state.sources.extend(added)
-            st.session_state.sources = dedupe_sources(st.session_state.sources)
-            st.success(f"Imported {len(added)} source item(s).")
-            for e in errors:
-                st.warning(e)
-                
-    st.divider()
-    st.subheader("Collected sources")
-    if st.session_state.sources:
-        st.dataframe(
-            [{"Title": s["title"], "Source": s["url"], "Content Length (Chars)": len(s.get("markdown_body", s.get("text", "")))} for s in st.session_state.sources],
-            use_container_width=True, hide_index=True
-        )
-        if st.button("Generate concepts from sources", type="primary"):
-            key = api_key.strip()
-            if not key:
-                try:
-                    key = st.secrets.get("ANTHROPIC_API_KEY", "")
-                except Exception:
-                    key = ""
-            with st.spinner("Extracting metadata & building concept structure..."):
-                try:
-                    if key:
-                        concepts = llm_extract(st.session_state.sources, key, model, extraction_depth, business_type)
-                    else:
-                        concepts = fallback_concepts(st.session_state.sources)
-                        st.info("No API key configured: created basic OKF concepts preserving full document text. Add an API key for automatic relation discovery.")
-                    
-                    st.session_state.concepts_json = json.dumps(concepts, ensure_ascii=False, indent=2)
-                    st.success(f"Prepared {len(concepts)} draft concept(s). Review them in Tab 2.")
-                except Exception as e:
-                    st.error(f"Generation failed: {e}")
+            out.append(analyze_heuristic(p, min_mentions, max_entities))
+        bar.progress(i / len(pages), f"Analysed {i}/{len(pages)}: {p.url[:70]}")
+    bar.empty()
+    return out
+
+
+def options() -> BuildOptions:
+    return BuildOptions(title=b_title, description=b_desc, vocabulary=vocab, status=status,
+                        stale_days=int(stale_days), content_mode=content_mode,
+                        min_entity_pages=int(min_pages), reviewer=reviewer.strip())
+
+
+t_ingest, t_classify, t_extract, t_build, t_validate, t_graph = st.tabs(
+    ["📥 Read pages", "🏷️ Classify & review", "🧩 Entities & concepts", "📦 Build bundle", "✅ Validate", "🕸️ Graph"])
+
+# --------------------------------------------------------------------------- #
+# 1. Ingest
+# --------------------------------------------------------------------------- #
+with t_ingest:
+    st.subheader("Read pages")
+    mode = st.radio("Source", ["URL list", "Sitemap", "Crawl a site", "Upload files"], horizontal=True)
+    pages = None
+    if mode == "URL list":
+        urls = st.text_area("One URL per line", height=140, placeholder="https://example.com/\nhttps://example.com/blog/post")
+        if st.button("Read pages", type="primary", disabled=not urls.strip()):
+            lst = [u.strip() for u in urls.splitlines() if u.strip().startswith("http")]
+            bar = st.progress(0.0)
+            pages = fetch_many(lst, delay, robots, lambda i, n, u: bar.progress(i / n, f"{i}/{n} {u[:70]}"))
+            bar.empty()
+    elif mode == "Sitemap":
+        sm = st.text_input("Sitemap URL", placeholder="https://example.com/sitemap.xml")
+        limit = st.number_input("Max pages", 1, 500, 50)
+        filt = st.text_input("Only URLs containing (optional)", "")
+        if st.button("Read pages", type="primary", disabled=not sm.strip()):
+            with st.spinner("Reading sitemap…"):
+                lst = [u for u in sitemap_urls(sm.strip(), int(limit) * 3) if filt in u][: int(limit)]
+            st.caption(f"{len(lst)} URLs found in sitemap")
+            bar = st.progress(0.0)
+            pages = fetch_many(lst, delay, robots, lambda i, n, u: bar.progress(i / n, f"{i}/{n} {u[:70]}"))
+            bar.empty()
+    elif mode == "Crawl a site":
+        start = st.text_input("Start URL", placeholder="https://example.com/")
+        limit = st.number_input("Max pages", 1, 300, 25)
+        if st.button("Crawl", type="primary", disabled=not start.strip()):
+            bar = st.progress(0.0)
+            pages = crawl(start.strip(), int(limit), delay, robots, lambda i, n, u: bar.progress(i / n, f"{i}/{n} {u[:70]}"))
+            bar.empty()
     else:
-        st.info("No sources yet. Crawl a website or upload supported files to begin.")
+        ups = st.file_uploader("HTML, Markdown or text files", type=["html", "htm", "md", "txt"], accept_multiple_files=True)
+        if st.button("Read files", type="primary", disabled=not ups):
+            pages = [parse_upload(u.name, u.getvalue()) for u in ups]
 
-with tab_review:
-    st.subheader("Review and edit concept metadata")
-    st.caption("Edit concept JSON attributes below. Full document text will be preserved in the generated output files.")
-    client_name = st.text_input("Client name for bundle", value=st.session_state.client_name)
-    st.session_state.client_name = client_name
-    
-    edited_json = st.text_area("Concept Metadata JSON", value=st.session_state.concepts_json, height=430)
-    if st.button("Save concept edits"):
-        try:
-            parsed = json.loads(edited_json)
-            if not isinstance(parsed, list):
-                raise ValueError("Top-level JSON must be a list of concepts.")
-            for idx, concept in enumerate(parsed):
-                if not isinstance(concept, dict):
-                    raise ValueError(f"Concept {idx+1} must be an object.")
-                if not str(concept.get("title", "")).strip():
-                    raise ValueError(f"Concept {idx+1} is missing title.")
-                if not str(concept.get("type", "")).strip():
-                    raise ValueError(f"Concept {idx+1} is missing type.")
-            st.session_state.concepts_json = json.dumps(parsed, ensure_ascii=False, indent=2)
-            st.success(f"Saved {len(parsed)} concept(s).")
-        except Exception as e:
-            st.error(f"Could not save edits: {e}")
-            
-    try:
-        parsed_concepts = json.loads(st.session_state.concepts_json)
-        st.metric("Current concepts", len(parsed_concepts))
-        if parsed_concepts:
-            st.dataframe([{
-                "Title": c.get("title", ""),
-                "Type": c.get("type", ""),
-                "Body Length": len(c.get("full_body", "")),
-                "Facts": len(c.get("facts", [])),
-                "Relationships": len(c.get("relationships", []))
-            } for c in parsed_concepts], use_container_width=True, hide_index=True)
-    except Exception:
-        st.info("Save valid JSON edits to refresh summary.")
+    if pages is not None:
+        ss.pages = pages
+        ss.analyses = run_analysis(pages)
+        ss.bundle, ss.report = {}, None
+        ok = sum(p.ok for p in pages)
+        st.success(f"Read {ok} of {len(pages)} pages and classified them. Review them in the next tab.")
 
-with tab_export:
-    st.subheader("Validate and export OKF bundle")
-    try:
-        concepts = json.loads(st.session_state.concepts_json)
-        if not isinstance(concepts, list):
-            raise ValueError("Concept JSON must be a list.")
-    except Exception as e:
-        concepts = []
-        st.error(f"Fix the concept JSON before export: {e}")
-        
-    client_slug = slugify(st.session_state.client_name or "client")
-    if st.button("Build and validate bundle", type="primary", disabled=not concepts):
-        try:
-            bundle = make_bundle(concepts, client_slug)
-            issues, count = validate_bundle(bundle)
-            st.session_state.bundle = bundle
-            st.session_state.validation = issues
-            st.session_state.concept_count = count
-            st.success(f"OKF Bundle built with {count} concept document(s).")
-        except Exception as e:
-            st.error(f"Bundle generation failed: {e}")
-            
-    if st.session_state.bundle:
-        issues = st.session_state.get("validation", [])
-        count = st.session_state.get("concept_count", 0)
-        errors = sum(1 for i in issues if i[0] == "ERROR")
-        warnings = sum(1 for i in issues if i[0] == "WARNING")
-        
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Concept files", count)
-        c2.metric("Errors", errors)
-        c3.metric("Warnings", warnings)
-        
-        if issues:
-            st.dataframe([{"Severity": x[0], "File": x[1], "Issue": x[2]} for x in issues], use_container_width=True, hide_index=True)
+    if ss.pages:
+        df = pd.DataFrame([{"URL": p.url, "Title": p.title, "Words": len((p.text or p.markdown).split()),
+                            "JSON-LD types": ", ".join(sorted({str(n.get('@type')) for n in p.jsonld}))[:60],
+                            "Internal links": len(p.internal_links), "Status": p.error or "OK"} for p in ss.pages])
+        st.dataframe(df, width="stretch", hide_index=True)
+        bad = [a for a in ss.analyses if a.error]
+        if bad:
+            with st.expander(f"{len(bad)} page(s) had problems"):
+                for a in bad:
+                    st.write(f"**{a.page.url}** — {a.error}")
+
+# --------------------------------------------------------------------------- #
+# 2. Classify & review
+# --------------------------------------------------------------------------- #
+with t_classify:
+    st.subheader("Page types")
+    if not ss.analyses:
+        st.info("Read some pages first.")
+    else:
+        rows = [{"include": a.include, "reviewed": a.reviewed, "title": a.page.title or a.page.url,
+                 "page_type": a.page_type, "confidence": a.classification.confidence,
+                 "okf type": okf_type_for(a.page_type, vocab), "entities": len(a.entities),
+                 "concepts": len(a.concepts), "url": a.page.url, "method": a.method}
+                for a in ss.analyses]
+        edited = st.data_editor(
+            pd.DataFrame(rows), width="stretch", hide_index=True, key="cls_editor",
+            column_config={
+                "include": st.column_config.CheckboxColumn("Include"),
+                "reviewed": st.column_config.CheckboxColumn("Reviewed", help="Adds verified: human:… on build (needs reviewer actor)"),
+                "page_type": st.column_config.SelectboxColumn("Page type", options=PAGE_TYPES, required=True),
+                "confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=1, format="%.2f"),
+                "url": st.column_config.LinkColumn("URL"),
+            },
+            disabled=["title", "confidence", "okf type", "entities", "concepts", "url", "method"])
+        for a, (_, r) in zip(ss.analyses, edited.iterrows()):
+            a.include, a.reviewed, a.page_type = bool(r["include"]), bool(r["reviewed"]), r["page_type"]
+        if any(a.reviewed for a in ss.analyses) and not reviewer.startswith("human:"):
+            st.warning("You ticked 'Reviewed' but the reviewer actor in the sidebar doesn't start with `human:` — no `verified` entry will be written.")
+
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            dist = Counter(a.page_type for a in ss.analyses if a.include)
+            st.bar_chart(pd.Series(dist, name="pages"))
+        with c2:
+            labels = [f"{i + 1}. {(x.page.title or x.page.url)[:80]}" for i, x in enumerate(ss.analyses)]
+            pick = st.selectbox("Why was this page classified this way?", labels)
+            a = ss.analyses[labels.index(pick)]
+            st.markdown(f"**{a.page_type}** · confidence {a.classification.confidence:.2f} · via `{a.method}`")
+            for s in a.classification.signals[:12]:
+                st.markdown(f"- {s}")
+            st.markdown(f"**Summary:** {a.summary}")
+            st.markdown("**Tags:** " + (", ".join(a.tags) or "—"))
+
+# --------------------------------------------------------------------------- #
+# 3. Entities & concepts
+# --------------------------------------------------------------------------- #
+with t_extract:
+    st.subheader("Entities and concepts across all pages")
+    if not ss.analyses:
+        st.info("Read some pages first.")
+    else:
+        agg = defaultdict(lambda: {"name": "", "type": Counter(), "pages": 0, "desc": "", "origin": set()})
+        cagg = defaultdict(lambda: {"name": "", "kind": Counter(), "pages": 0, "def": ""})
+        for a in ss.analyses:
+            if not a.include:
+                continue
+            for e in a.entities:
+                g = agg[norm_key(e.name)]
+                g["name"] = g["name"] or e.name
+                g["type"][e.entity_type] += 1
+                g["pages"] += 1
+                g["desc"] = max(g["desc"], e.description, key=len)
+                g["origin"].add(e.origin)
+            for c in a.concepts:
+                g = cagg[norm_key(c.name)]
+                g["name"] = g["name"] or c.name
+                g["kind"][c.kind] += 1
+                g["pages"] += 1
+                g["def"] = max(g["def"], c.definition, key=len)
+        st.markdown(f"**{len(agg)} entities** · **{len(cagg)} concepts / playbooks / systems**")
+        st.caption("Untick to drop, edit name or type to merge/rename. Changes apply to every page that mentions it.")
+        edf = pd.DataFrame([{"keep": True, "key": k, "name": g["name"], "entity_type": g["type"].most_common(1)[0][0],
+                             "pages": g["pages"], "origin": ", ".join(sorted(g["origin"])), "description": g["desc"]}
+                            for k, g in sorted(agg.items(), key=lambda kv: -kv[1]["pages"])])
+        cdf = pd.DataFrame([{"keep": True, "key": k, "name": g["name"], "kind": g["kind"].most_common(1)[0][0],
+                             "pages": g["pages"], "definition": g["def"]}
+                            for k, g in sorted(cagg.items(), key=lambda kv: -kv[1]["pages"])])
+        ce, cc = st.columns(2)
+        with ce:
+            e_ed = st.data_editor(edf, hide_index=True, width="stretch", key="ent_ed",
+                                  column_config={"key": None,
+                                                 "entity_type": st.column_config.SelectboxColumn("Type", options=ENTITY_TYPES)},
+                                  disabled=["pages", "origin"]) if len(edf) else edf
+        with cc:
+            c_ed = st.data_editor(cdf, hide_index=True, width="stretch", key="con_ed",
+                                  column_config={"key": None,
+                                                 "kind": st.column_config.SelectboxColumn("Kind", options=["concept", "playbook", "system"])},
+                                  disabled=["pages"]) if len(cdf) else cdf
+            if not len(cdf):
+                st.caption("No concepts yet. LLM mode extracts concepts and playbooks; heuristics only find glossary-style definitions.")
+        if st.button("Apply edits", type="primary"):
+            emap = {r.key: r for r in e_ed.itertuples()} if len(edf) else {}
+            cmap = {r.key: r for r in c_ed.itertuples()} if len(cdf) else {}
+            for a in ss.analyses:
+                ne = []
+                for e in a.entities:
+                    r = emap.get(norm_key(e.name))
+                    if r is None or r.keep:
+                        if r is not None:
+                            e.name, e.entity_type = r.name, r.entity_type
+                            e.description = r.description or e.description
+                        ne.append(e)
+                a.entities = ne
+                nc = []
+                for c in a.concepts:
+                    r = cmap.get(norm_key(c.name))
+                    if r is None or r.keep:
+                        if r is not None:
+                            c.name, c.kind = r.name, r.kind
+                            c.definition = r.definition or c.definition
+                        nc.append(c)
+                a.concepts = nc
+            st.success("Edits applied.")
+            st.rerun()
+
+# --------------------------------------------------------------------------- #
+# 4. Build
+# --------------------------------------------------------------------------- #
+with t_build:
+    st.subheader("Build the OKF bundle")
+    if not ss.analyses:
+        st.info("Read some pages first.")
+    else:
+        n_inc = sum(a.include and a.page.ok for a in ss.analyses)
+        st.markdown(f"{n_inc} pages will become concepts, plus their entities and concepts. "
+                    f"Vocabulary: **{vocab}** · status **{status}** · stale after **{stale_days}** days.")
+        if st.button("Build bundle", type="primary", disabled=n_inc == 0):
+            ss.bundle = build_bundle(ss.analyses, options())
+            ss.report = validate(ss.bundle)
+            ss.report_files, ss.report_src = ss.bundle, "built"
+        if ss.bundle:
+            rep = validate(ss.bundle)
+            c = rep.counts()
+            m = st.columns(5)
+            m[0].metric("Files", len(ss.bundle))
+            m[1].metric("Concepts", rep.stats["concepts"])
+            m[2].metric("Links", rep.stats["edges"])
+            m[3].metric("Conformant", "Yes" if rep.conformant else "No")
+            m[4].metric("Warnings", c.get("warning", 0))
+            d1, d2 = st.columns(2)
+            d1.download_button("Download bundle (.zip)", zip_bundle(ss.bundle, "okf-bundle"),
+                               "okf-bundle.zip", "application/zip", type="primary", width="stretch")
+            d2.download_button("Download graph.json", json.dumps(graph_json(rep), indent=2),
+                               "graph.json", "application/json", width="stretch")
+            left, right = st.columns([1, 2])
+            with left:
+                tree = defaultdict(list)
+                for p in ss.bundle:
+                    tree[p.rsplit("/", 1)[0] if "/" in p else "(root)"].append(p)
+                for d in sorted(tree):
+                    st.markdown(f"**{d}/** — {len(tree[d])}")
+                sel = st.selectbox("Preview file", list(ss.bundle))
+            with right:
+                st.code(ss.bundle[sel], language="markdown")
+
+# --------------------------------------------------------------------------- #
+# 5. Validate
+# --------------------------------------------------------------------------- #
+with t_validate:
+    st.subheader("Validate an OKF bundle")
+    st.caption("Errors break §11 conformance. Warnings break a SHOULD inside the v0.2 trust/provenance families or use "
+               "superseded v0.1 fields. Info items are health signals the spec says consumers must tolerate.")
+    src = st.radio("Bundle", ["Built in this app", "Upload .zip", "Upload .md files"], horizontal=True)
+    files = None
+    if src == "Built in this app":
+        files = ss.bundle or None
+        if not files:
+            st.info("Build a bundle first, or upload one.")
+    elif src == "Upload .zip":
+        z = st.file_uploader("Bundle zip", type=["zip"])
+        if z:
+            files = read_zip(z.getvalue())
+    else:
+        mds = st.file_uploader("Markdown files (paths are flattened to the bundle root)", type=["md"], accept_multiple_files=True)
+        if mds:
+            files = {m.name: m.getvalue().decode("utf-8", errors="replace") for m in mds}
+    if files:
+        fix = st.checkbox("Preview safe auto-fixes (indexes, okf_version, UTC offsets, log order)")
+        fixlog: list[str] = []
+        if fix:
+            files, fixlog = apply_fixes(files)
+        rep = validate(files)
+        ss.report, ss.report_files, ss.report_src = rep, files, src
+        c = rep.counts()
+        m = st.columns(6)
+        m[0].metric("Conformant (§11)", "Yes ✅" if rep.conformant else "No ❌")
+        m[1].metric("Errors", c.get("error", 0))
+        m[2].metric("Warnings", c.get("warning", 0))
+        m[3].metric("Info", c.get("info", 0))
+        m[4].metric("Concepts", rep.stats["concepts"])
+        m[5].metric("okf_version", rep.okf_version or "—")
+        s = rep.stats
+        st.markdown(
+            f"**Trust tiers:** {', '.join(f'{k} {v}' for k, v in s['trust_tiers'].items()) or '—'} · "
+            f"**Stale:** {s['stale']} · **With description:** {s['pct_description']}% · "
+            f"**With sources:** {s['pct_sources']}% · **Orphans:** {s['orphans']} · **Broken links:** {s['broken_links']}")
+        if fixlog:
+            with st.expander(f"{len(fixlog)} fix(es) applied"):
+                st.write("\n".join(f"- {x}" for x in fixlog))
+            st.download_button("Download fixed bundle (.zip)", zip_bundle(files, "okf-bundle"), "okf-bundle-fixed.zip")
+        if rep.findings:
+            fdf = pd.DataFrame([f.__dict__ for f in rep.findings])
+            sev = st.multiselect("Severity", ["error", "warning", "info"], default=["error", "warning", "info"])
+            rules = st.multiselect("Rule", sorted(fdf.rule.unique()))
+            view = fdf[fdf.severity.isin(sev)]
+            if rules:
+                view = view[view.rule.isin(rules)]
+            st.dataframe(view, width="stretch", hide_index=True,
+                         column_config={"severity": st.column_config.TextColumn("Severity", width="small"),
+                                        "spec": st.column_config.TextColumn("Spec", width="small")})
+            with st.expander("Rule summary"):
+                st.dataframe(fdf.groupby(["severity", "rule"]).size().rename("count").reset_index(),
+                             hide_index=True, width="stretch")
         else:
-            st.success("OKF v0.2 structural verification passed.")
-            
-        with st.expander("Preview generated bundle files"):
-            for path, content in st.session_state.bundle.items():
-                with st.expander(path):
-                    st.code(content, language="markdown")
-                    
-        memory = io.BytesIO()
-        with zipfile.ZipFile(memory, "w", zipfile.ZIP_DEFLATED) as zf:
-            for path, content in st.session_state.bundle.items():
-                zf.writestr(f"{client_slug}-okf/{path}", content)
-            report = {
-                "app_version": APP_VERSION,
-                "target_specification": "OKF v0.2",
-                "client": st.session_state.client_name,
-                "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-                "concept_count": count,
-                "validation_issues": [{"severity": x[0], "file": x[1], "issue": x[2]} for x in issues]
-            }
-            zf.writestr(f"{client_slug}-okf/validation-report.json", json.dumps(report, indent=2))
-            
-        st.download_button(
-            "Download OKF bundle (.zip)", data=memory.getvalue(),
-            file_name=f"{client_slug}-okf-bundle.zip", mime="application/zip",
-            type="primary", use_container_width=True
-        )
-    else:
-        st.info("Generate concepts, review them, then build the bundle here.")
+            st.success("No findings. Clean bundle.")
+        r1, r2 = st.columns(2)
+        r1.download_button("Report (.json)", json.dumps(rep.to_dict(), indent=2, default=str), "okf-report.json",
+                           width="stretch")
+        r2.download_button("Report (.md)", rep.to_markdown(), "okf-report.md", width="stretch")
 
-st.divider()
-st.caption("CT OKF Builder is an internal prototype. Crawling is restricted to same-domain URLs discovered from common sitemap locations.")
+# --------------------------------------------------------------------------- #
+# 6. Graph
+# --------------------------------------------------------------------------- #
+with t_graph:
+    rep, files = ss.report, ss.report_files
+    if rep is None or not files:
+        st.info("Build or validate a bundle to see its graph.")
+    else:
+        types = sorted({c.type or "(none)" for c in rep.concepts.values()})
+        top = st.columns([1.2, 4, 1])
+        show_sys = top[0].toggle("Show system nodes", value=False, help="index.md and log.md")
+        if hasattr(st, "pills"):
+            chosen = top[1].pills("Filter types", types, selection_mode="multi", default=types)
+        else:
+            chosen = top[1].multiselect("Filter types", types, default=types)
+        physics = top[2].toggle("Physics", value=True)
+        page_html = render_html(rep, files, set(chosen or []), show_sys, 700, physics)
+        if hasattr(st, "iframe"):          # Streamlit >= 1.52
+            st.iframe(page_html, height=720)
+        else:
+            components.html(page_html, height=720, scrolling=False)
+        inbound = Counter(b for _, b in rep.edges)
+        g1, g2 = st.columns(2)
+        with g1:
+            st.markdown("**Most-linked concepts (hubs)**")
+            st.dataframe(pd.DataFrame([{"concept": rep.concepts[p].title, "type": rep.concepts[p].type, "inbound": n}
+                                       for p, n in inbound.most_common(12)]), hide_index=True, width="stretch")
+        with g2:
+            orph = [c for c in rep.concepts.values() if not c.links_out and not inbound.get(c.path)]
+            st.markdown(f"**Islands (no links in or out): {len(orph)}**")
+            st.dataframe(pd.DataFrame([{"concept": c.title, "type": c.type, "path": c.path} for c in orph]),
+                         hide_index=True, width="stretch")
